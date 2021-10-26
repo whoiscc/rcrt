@@ -26,6 +26,8 @@ public class Tracker {
                     }
                     break;
                 }
+                case "TINYPROJ$QUERY":
+                    break;
                 case "TINYPROJ$PLAYER_FAIL": {
                     assert primary != null;
                     assert playerMap.size() >= 3;

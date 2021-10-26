@@ -53,6 +53,7 @@ public class Game {
     private HashMap<String, LinkedBlockingQueue<Integer>> queueMap;
     private Socket client;
     private final Object moveBarrier = new Object();
+    private final Object syncBarrier = new Object();
     private final Object appMutex = new Object();
 
     private Game(SocketAddress addr, String name, DatagramSocket tracker) throws Exception {
@@ -138,19 +139,35 @@ public class Game {
                 assert scanner.next().equals("TINYPROJ$MOVE");
                 var name = scanner.next();
                 assert scanner.nextInt() == 0;
-                System.out.println("Accept connection: name = " + name);
+                System.out.println("* Accept connection: name = " + name);
                 connMap.put(name, conn);
 
                 movePlayer(name, 0);
+
+                var writer = new StringWriter();
+                writer.write("TINYPROJ$QUERY\n");
+                var buf = writer.toString().getBytes();
+                tracker.send(new DatagramPacket(buf, buf.length));
+                return;
             }
             for (var entry : connMap.entrySet()) {
                 if (entry.getValue().getInputStream().available() == 0) {
                     continue;
                 }
                 var scanner = new Scanner(entry.getValue().getInputStream());
-                assert scanner.next().equals("TINYPROJ$MOVE");  // TODO SYNC_OK
-                assert scanner.next().equals(entry.getKey());
-                movePlayer(entry.getKey(), scanner.nextInt());
+                switch (scanner.next()) {
+                    case "TINYPROJ$MOVE":
+                        assert scanner.next().equals(entry.getKey());
+                        movePlayer(entry.getKey(), scanner.nextInt());
+                        break;
+                    case "TINYPROJ$SYNC_OK":
+                        synchronized (syncBarrier) {
+                            syncBarrier.notify();
+                        }
+                        break;
+                    default:
+                        assert false;
+                }
             }
         }
     }
@@ -163,6 +180,19 @@ public class Game {
             threadMap.get(name).start();
         }
         queueMap.get(name).put(direction);
+    }
+
+    private void syncState() throws Exception {
+        if (view.backup == null || !connMap.containsKey(view.backup)) {
+            return;
+        }
+        var writer = new StringWriter();
+        writer.write("TINYPROJ$SYNC\n");
+        // TODO
+        connMap.get(view.backup).getOutputStream().write(writer.toString().getBytes());
+        synchronized (syncBarrier) {
+            syncBarrier.wait();
+        }
     }
 
     private void sendState(String name) throws Exception {
@@ -181,9 +211,22 @@ public class Game {
     private void runClient() throws Exception {
         var scanner = new Scanner(client.getInputStream());
         while (true) {
-            assert scanner.next().equals("TINYPROJ$STATE");  // TODO SYNC
-            synchronized (moveBarrier) {
-                moveBarrier.notify();
+            switch (scanner.next()) {
+                case "TINYPROJ$STATE":
+                    synchronized (moveBarrier) {
+                        moveBarrier.notify();
+                    }
+                    break;
+                case "TINYPROJ$SYNC": {
+                    assert mode.equals("BACKUP");
+                    // TODO
+                    var writer = new StringWriter();
+                    writer.write("TINYPROJ$SYNC_OK\n");
+                    client.getOutputStream().write(writer.toString().getBytes());
+                    break;
+                }
+                default:
+                    assert false;       
             }
         }
     }
@@ -250,7 +293,9 @@ public class Game {
                             "** Mutex move: player = %s, direction = %d%n", 
                             name, direction
                         );
-                        // TODO update & sync
+                        // TODO update
+
+                        game.syncState();
                     }
                     game.sendState(name);
                 }
