@@ -92,7 +92,7 @@ public class Transport {
                 }
             }
         } catch (IOException e) {
-            Logger.getGlobal().throwing(Transport.class.getName(), "socketReceiveRaw", e);
+            // Logger.getGlobal().throwing(Transport.class.getName(), "socketReceiveRaw", e);
             Logger.getGlobal().info("ignore exception and expect failure detected soon");
             return null;
         }
@@ -117,7 +117,7 @@ public class Transport {
         try {
             channel.write(dump(msgType, msg));
         } catch (IOException e) {
-            Logger.getGlobal().throwing(Transport.class.getName(), "send", e);
+            // Logger.getGlobal().throwing(Transport.class.getName(), "send", e);
             Logger.getGlobal().info("ignore exception and expect failure detected soon");
         }
     }

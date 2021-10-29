@@ -100,7 +100,7 @@ public class Game {
         if (!view.primary().equals(name)) {
             // wait until primary up to date and set up
             if (this.view != null && this.view.primary().equals(view.primary())) {
-                Thread.sleep(500);  // previous client guard exit
+                Thread.sleep(600);  // 500ms previous client guard exit + 100ms redundancy
             } else {            
                 // 1000ms detection + 200ms reaction
                 Thread.sleep(1200);
@@ -111,7 +111,7 @@ public class Game {
             client.bind(addr);
 
             // client.connect(view.serverAddr());
-            // simple hack, only work for localhost setup
+            // simple hack to shorten connecting timeout, only work for localhost setup
             client.configureBlocking(false);
             log.entering(SocketChannel.class.getName(), "connect");
             client.connect(view.serverAddr());
@@ -188,14 +188,14 @@ public class Game {
                     backup = null;  // disable backup before mutate app
                 }
 
-                // var iter = workerTable.entrySet().iterator();
-                // while (iter.hasNext()) {
-                //     var entry = iter.next();
-                //     if (!heartbeatSet.contains(entry.getKey()) && !entry.getKey().equals(name)) {
-                //         entry.getValue().interrupt();
-                //         iter.remove();
-                //     }
-                // }
+                var iter = workerTable.entrySet().iterator();
+                while (iter.hasNext()) {
+                    var entry = iter.next();
+                    if (!heartbeatSet.contains(entry.getKey()) && !entry.getKey().equals(name)) {
+                        entry.getValue().interrupt();
+                        iter.remove();
+                    }
+                }
 
                 if (!heartbeatSet.contains(view.backup())) {
                     if (!heartbeatSet.isEmpty()) {
@@ -303,7 +303,7 @@ public class Game {
     private static class WorkerThread extends Thread {
         private final String name;
         private SocketChannel channel;
-        private final LinkedBlockingQueue<Integer> taskQueue;
+        private final LinkedBlockingQueue<Object> taskQueue;
         private final Game game;
 
         public WorkerThread(String name, SocketChannel channel, Game game) {
@@ -327,9 +327,9 @@ public class Game {
                 }
                 log.info("player ready: " + name);
                 while (true) {
-                    int direction;
+                    Object task;
                     try {
-                        direction = taskQueue.take();
+                        task = taskQueue.take();
                     } catch (InterruptedException e) {
                         interrupted();
                         break;
@@ -371,11 +371,11 @@ public class Game {
                     new Transport.SyncMessage(app)    
                 );
                 // TODO backup crash during this
-                log.entering("syncBarrier", "wait");
+                // log.entering("syncBarrier", "wait");
                 while (!syncDone) {
                     syncBarrier.wait();
                 }
-                log.exiting("syncBarrier", "wait");
+                // log.exiting("syncBarrier", "wait");      
             }            
         } finally {
             inSync = null;

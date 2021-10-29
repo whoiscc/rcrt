@@ -1,0 +1,32 @@
+tinyproj
+
+A simple starting point of Random Collection of Rigid Things (RCRT) project. A distributed, primary-backup replicated system written in Java.
+
+Coded and tested with OpenJDK 17 @ Ubuntu 20.04.3:
+$ javac StressTest.java
+$ ./run
+
+Notice: must be kept foreground, e.g., when run in VSCode terminal, do not hide terminal while running. Don't know why.
+
+The system design requirement and `StressTest` is adapted from certain distributed system course's assignment. The following repos that implementing the same assignment is publicly accessible by Oct 29, 2021:
+https://github.com/slai11/distributed-maze-game
+https://github.com/alanwuha/cs5223-distributed-maze-game
+
+The implementation is generalized to make it unrelated to original assignment, so it would be hard to adapt from, and can be easily converted for any distributed application. To be specific, the `App` class is minimal, and the transport layer is lack of message types for application-specific request and reply.
+
+Features
+The stress test waits "up to 5 seconds" when create/kill nodes, but in fact it basically continues instantly. This could result in nodes with super short lifetime, like `ai` with default seed. It is basically safe to assume that such node has a so short up time (or just let it sleep a while before being active) that all the other nodes and tracker will not notice it. However, the system would be considered stronger if it can tolerance the case that the node fails between reaching tracker and primary.
+
+The challenge of such case is that tracker will not notice the node failed, and may pick it as backup in the future. My solution is to ask the nodes to pick the following backup nodes. This results in an almost stateless tracker, which is more harder to become system bottleneck than other design.
+
+All processes use java.nio for communication. Tracker uses blocking UDP, client nodes use blocking TCP, and primary server uses non-blocking TCP. The transport layer, includes messages definitions and serialization/deserialization, is shared among all channels, utilized universally. As the result, the codebase is as small as less than 800 lines of code, which resolves a original goal of this tinyproj.
+
+Shortages
+The timeline of different system situation is unclear, not unify, and undocumented. Sleep-waiting is all around the code, which makes the code hard to maintain and reason about.
+
+The code has a basic classification of different node states, i.e., primary, backup and other clients. However, all transitions or intermediate states are unclear and implicit. For example, `client` is closed and null-ified if node detects current primary failed, which can be followed by either a client->client, client->backup, or backup->primary transition. The action of starting next view does not depend on which kind of transition is performing, but testing result of discrete variables like `client == null`. This results in compacted but hard-to-follow code.
+
+Upon primary failing, current backup use a query loop to passively handle the view change. It works, but is not graceful both in concept and in practice.
+
+
+Copyright 2021 Correctizer.
