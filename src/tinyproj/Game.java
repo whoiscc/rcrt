@@ -1,461 +1,492 @@
 import java.net.*;
+import java.nio.*;
+import java.nio.channels.*;
 import java.util.*;
+import java.util.logging.*;
 import java.util.concurrent.*;
 import java.io.*;
-import java.nio.channels.*;
 
 public class Game {
+    private static final Logger log = Logger.getGlobal();
     public static void main(String[] args) throws Exception {
-        var socket = new Socket();
-        socket.bind(null);
-        var addr = (InetSocketAddress) socket.getLocalSocketAddress();
-        socket.close();
-        var tracker = new DatagramSocket();
-        tracker.connect(new InetSocketAddress(args[0], Integer.parseInt(args[1])));
+        log.setLevel(Level.ALL);
+        log.setUseParentHandlers(false);
+        System.setProperty(
+            "java.util.logging.SimpleFormatter.format",
+            "[%1$tT.%1$tL] [%2$s] %5$s%6$s%n"
+        );
+        var handler = new ConsoleHandler();
+        handler.setLevel(Level.ALL);
+        handler.setFormatter(new SimpleFormatter());
+        log.addHandler(handler);
+
         var name = args[2];
-        System.out.printf("* Player start, address = %s, name = %s%n", addr, name);
-
-        var writer = new StringWriter();
-        writer.write("TINYPROJ$HELLO\n");
-        writer.write(name + "\n");
-        writer.write(addr.getHostName() + "\n");
-        writer.write(addr.getPort() + "\n");
-        var buf = writer.toString().getBytes();
-        tracker.send(new DatagramPacket(buf, buf.length));
-        buf = new byte[1500];
-        var pkt = new DatagramPacket(buf, buf.length);
-
-        var game = new Game(addr, name, tracker);
-        while (true) {
-            tracker.receive(pkt);
-            var view = View.fromReply(new String(buf, 0, pkt.getLength()));
-            try {
-                System.out.printf(
-                    "* Start view: primary = %s, backup = %s%n", 
-                    view.primary, view.backup
-                );
-                game.startView(view);
-                System.out.printf("* Start view done: mode = %s%n", game.mode);
-            } catch (ConnectException e) {
-                game.kickPlayer(view.primary);
-                continue;
+        var addr = generateAddress();
+        var tracker = new Tracker(
+            name, addr, new InetSocketAddress(args[0], Integer.parseInt(args[1]))
+        );
+        log.fine("game start: name = " + name + ", addr = " + addr);
+        var game = new Game(name, addr, tracker);
+        game.tracker.query();
+        try {
+            while (true) {
+                var view = game.tracker.receiveView();
+                log.entering(Game.class.getName(), "startView", view);
+                try {
+                    game.startView(view);
+                } catch (ConnectException e) {
+                    // risky?
+                    log.info("start view fail: primary = " + view.primary());
+                    game.tracker.playerFail(view.id(), view.primary(), name);
+                    game.client = null;
+                    continue;
+                }
+                if (view.primary().equals(name)) {
+                    log.entering(Game.class.getName(), "runServer");
+                    game.runServer();
+                } else {
+                    log.entering(Game.class.getName(), "runClient");
+                    game.runClient();
+                }
             }
-            if (game.mode.equals("PRIMARY")) {
-                game.runServer();
-            } else {
-                game.runClient();
-            }
+        } catch (Throwable e) {
+            log.throwing(Game.class.getName(), "main", e);
+        } finally {
+            // A successful run always terminates externally
+            System.exit(1);
         }
     }
 
-    private final SocketAddress addr;
-    private final String name;
-    private final DatagramSocket tracker;
-    private View view;
-    private String mode;  // redundant to view + name
-    private Selector serverSelector;
-    private ServerSocketChannel server;
-    private HashMap<String, Socket> connMap;
-    private HashMap<String, PlayerThread> threadMap;
-    private Thread inSyncThread;
-    private final UIThread uiThread;
-    private HashMap<String, LinkedBlockingQueue<Integer>> queueMap;
-    private Socket client;
-    private final Object moveBarrier = new Object();
-    private final Object syncBarrier = new Object();
-    private final Object appMutex = new Object();
+    private static InetSocketAddress generateAddress() throws Exception {
+        var channel = SocketChannel.open();
+        channel.socket().bind(new InetSocketAddress("", 0));
+        var addr = (InetSocketAddress) channel.getLocalAddress();
+        channel.close();
+        return addr;
+    }
 
-    private Game(SocketAddress addr, String name, DatagramSocket tracker) throws Exception {
-        this.addr = addr;
+    private final String name;
+    private final InetSocketAddress addr;
+    private final Tracker tracker;
+    private Tracker.View view;
+    private Game(String name, InetSocketAddress addr, Tracker tracker) {
         this.name = name;
+        this.addr = addr;
         this.tracker = tracker;
         view = null;
-        // TODO set n and k for app
-
-        serverSelector = null;
-        server = null;
-        connMap = null;
-        client = null;
-
-        inSyncThread = null;
-
-        uiThread = new UIThread(this);
-        uiThread.start();
     }
 
-    private record View(int n, int k, String primary, SocketAddress primaryAddr, String backup) {
-        public static View fromReply(String reply) {
-            Scanner scanner = new Scanner(reply);
-            assert scanner.next().equals("TINYPROJ$VIEW");
-            return new View(
-                scanner.nextInt(),
-                scanner.nextInt(),
-                scanner.next(),
-                new InetSocketAddress(scanner.next(), scanner.nextInt()),
-                scanner.hasNext() ? scanner.next() : null
-            );
+    private ServerSocketChannel server;
+    private Selector serverSel;
+    private SocketChannel backup;  // downlink for server
+    private SocketChannel client;  // uplink for client (including backup)
+    private App app;
+    private HashMap<String, WorkerThread> workerTable;
+    private void startView(Tracker.View view) throws Exception {
+        if (this.view != null) {
+            assert view.id() > this.view.id();
+            assert !view.primary().equals(this.view.primary()) ||
+                !view.backup().equals(this.view.backup());
         }
-    }
 
-    private void startView(View view) throws Exception {
-        if (this.view != null && mode.equals("PRIMARY")) {
-            assert view.primary.equals(name);
-            this.view = view;
-            return;
-        }
-        if (view.primary.equals(name)) {
-            assert server == null;
-            if (client != null) {
-                client.close();
-                Thread.sleep(100);
-                client = null;
-            }
-            serverSelector = Selector.open();
+        if (view.primary().equals(name) && server == null) {
             server = ServerSocketChannel.open();
             server.bind(addr);
             server.configureBlocking(false);
-            server.register(serverSelector, SelectionKey.OP_ACCEPT, null);
-            connMap = new HashMap<>();
-
-            threadMap = new HashMap<>();
-            queueMap = new HashMap<>();
-
-            if (this.view == null) {
-                // TODO initialize app
-            } else {
-                // assert mode.equals("BACKUP");
-            }
-            mode = "PRIMARY";
-            this.view = view;
-            return;
+            serverSel = Selector.open();
+            server.register(serverSel, SelectionKey.OP_ACCEPT);
         }
-
-        if (view.backup != null && view.backup.equals(name) && this.view != null && mode.equals("BACKUP")) {
-            assert view.primary.equals(this.view.primary);
-            this.view = view;
-            return;
-        }
-
-        assert this.view == null || mode.equals("CLIENT");
-        assert this.view == null || view.backup.equals(name) || !view.primary.equals(this.view.primary);
-        Thread.sleep(400);
-        if (this.view == null || !view.primary.equals(this.view.primary)) {
-            if (client != null) {
-                client.close();
-                Thread.sleep(100);
+        
+        if (!view.primary().equals(name)) {
+            // wait until primary up to date and set up
+            if (this.view != null && this.view.primary().equals(view.primary())) {
+                Thread.sleep(500);  // previous client guard exit
+            } else {            
+                // 1000ms detection + 200ms reaction
+                Thread.sleep(1200);
             }
-            client = new Socket();
+        }
+        if (!view.primary().equals(name) && client == null) {
+            client = SocketChannel.open();
             client.bind(addr);
-            client.connect(view.primaryAddr);
+
+            // client.connect(view.serverAddr());
+            // simple hack, only work for localhost setup
+            client.configureBlocking(false);
+            log.entering(SocketChannel.class.getName(), "connect");
+            client.connect(view.serverAddr());
+            log.exiting(SocketChannel.class.getName(), "connect");
+            Thread.sleep(1);
+            if (!client.finishConnect()) {
+                throw new ConnectException();
+            }
+            client.configureBlocking(true);
+            log.fine("connected");
+
+            Transport.send(
+                client, Transport.HelloMessage.TYPE, 
+                new Transport.HelloMessage(name)
+            );
         }
-        if (view.backup.equals(name)) {
-            // TODO initialize for backup
-            mode = "BACKUP";
-        } else {
-            mode = "CLIENT";
+
+        if (view.backup() != null && view.backup().equals(name)) {
+            assert app == null;
+            log.entering(Game.class.getName(), "initBackup");
+            Transport.send(
+                client, Transport.InitBackupRequestMessage.TYPE,
+                new Transport.InitBackupRequestMessage(view.id())
+            );
+            // TODO server crash from now on...
+            var buf = Transport.socketReceiveRaw(client);
+            assert buf.getInt() == Transport.InitBackupReplyMessage.TYPE;
+            var msgLen = buf.getInt();
+            var msg = (Transport.InitBackupReplyMessage) Transport.parse(buf);
+            app = msg.app();
+            log.exiting(
+                Game.class.getName(), 
+                "initBackup", 
+                "player set = " + app.playerSet()
+            );
+        }
+        if (view.primary().equals(name)) {
+            assert backup == null || this.view.id() == 1;
+            if (this.view != null && this.view.primary().equals(name)) {
+                assert !view.backup().equals(this.view.backup());
+            } else {
+                assert this.view == null || this.view.backup().equals(name);
+                if (this.view == null) {
+                    assert view.id() == 1;
+                    app = new App();
+                    app.createPlayer(name);
+                }
+                workerTable = new HashMap<>();
+                for (var name : app.playerSet()) {
+                    workerTable.put(name, new WorkerThread(name, null, this));
+                    workerTable.get(name).start();
+                }
+            }
         }
         this.view = view;
-        return;
     }
+
+    private final Object appMutex = new Object();
+    private final Object syncBarrier = new Object();
+    private Thread inSync;
+    private boolean syncDone = true;
 
     private void runServer() throws Exception {
-        if (connMap.containsKey(view.backup)) {
-            var writer = new StringWriter();
-            writer.write("TINYPROJ$RESET\n");
-            connMap.get(view.backup).getOutputStream().write(writer.toString().getBytes());
-        }
-        var heartbeatMap = new HashMap<String, Boolean>();
-        if (view.backup != null) {
-            heartbeatMap.put(view.backup, false);
-        }
-        for (var name : connMap.keySet()) {
-            heartbeatMap.put(name, false);
-        }
-        var nextCheckHeartbeat = System.currentTimeMillis() + 800;
-        var nextHeartbeat = System.currentTimeMillis();
+        var heartbeatSet = new HashSet<String>();
+        // 1200ms waiting in startView + 200ms reaction + 100ms redundant
+        var nextCheckHearbeat = System.currentTimeMillis() + 1500;
+        // pendingSwitchBackup == backup crash && hearbeatSet is {}
+        var pendingSwitchBackup = false;
         while (true) {
-            if (serverSelector.selectNow() != 0) {
-                serverSelector.selectedKeys().clear();
-                var conn = server.accept().socket();
-                System.out.println("* Incoming connection: " + conn.getRemoteSocketAddress());
-                Thread.sleep(300);
-                var scanner = new Scanner(conn.getInputStream());
-                assert scanner.next().equals("TINYPROJ$MOVE");
-                var name = scanner.next();
-                var direction = scanner.nextInt();
-                System.out.println("* Accept connection: name = " + name);
-                connMap.put(name, conn);
-
-                if (name == view.backup) {
-                    var writer = new StringWriter();
-                    writer.write("TINYPROJ$RESET\n");
-                    conn.getOutputStream().write(writer.toString().getBytes());
+            var now = System.currentTimeMillis();
+            if (now > nextCheckHearbeat && !pendingSwitchBackup) {
+                log.fine("check: heartbeat set = " + heartbeatSet);
+                if (!heartbeatSet.contains(view.backup())) {
+                    backup = null;  // disable backup before mutate app
                 }
-                movePlayer(name, direction);
 
-                queryView();
-                return;
-            }
-            if (System.currentTimeMillis() > nextCheckHeartbeat) {
-                for (var entry : heartbeatMap.entrySet()) {
-                    if (!entry.getValue()) {
-                        kickPlayer(entry.getKey());
+                // var iter = workerTable.entrySet().iterator();
+                // while (iter.hasNext()) {
+                //     var entry = iter.next();
+                //     if (!heartbeatSet.contains(entry.getKey()) && !entry.getKey().equals(name)) {
+                //         entry.getValue().interrupt();
+                //         iter.remove();
+                //     }
+                // }
+
+                if (!heartbeatSet.contains(view.backup())) {
+                    if (!heartbeatSet.isEmpty()) {
+                        var nextBackup = heartbeatSet.iterator().next();
+                        log.info("backup fail: " + view.backup() + ", next backup = " + nextBackup);
+                        tracker.playerFail(view.id(), view.backup(), nextBackup);
                         return;
-                    }
-                    entry.setValue(false);
-                }
-                nextCheckHeartbeat = System.currentTimeMillis() + 800;
-            }
-            if (System.currentTimeMillis() > nextHeartbeat) {
-                for (var entry: connMap.entrySet()) {
-                    var writer = new StringWriter();
-                    writer.write("TINYPROJ$HEARTBEAT\n");
-                    try {
-                        entry.getValue().getOutputStream().write(writer.toString().getBytes());
-                    } catch (IOException e) {
-                        kickPlayer(entry.getKey());
-                        return;
+                    } else {
+                        log.info("next backup not show up yet so pending");
+                        pendingSwitchBackup = true;
                     }
                 }
-                nextHeartbeat = System.currentTimeMillis() + 500;
+                heartbeatSet.clear();
+                nextCheckHearbeat = System.currentTimeMillis() + 600;
             }
 
-            for (var entry : connMap.entrySet()) {
-                if (entry.getValue().getInputStream().available() == 0) {
+            if (pendingSwitchBackup) {
+                serverSel.select();
+            } else {
+                serverSel.select(nextCheckHearbeat - now);
+            }
+            for (var k : serverSel.selectedKeys()) {
+                if (k.isAcceptable()) {
+                    assert k.channel() == server;
+                    var channel = server.accept();
+                    log.info("incoming connection: addr = " + channel.getRemoteAddress());
+                    channel.configureBlocking(false);
+                    channel.register(serverSel, SelectionKey.OP_READ);
                     continue;
                 }
-                var buf = new byte[1500];
-                var len = entry.getValue().getInputStream().read(buf);
-                assert len > 0;
-                var scanner = new Scanner(new String(buf, 0, len));
-                assert scanner.hasNext();
-                while (scanner.hasNext()) {
-                    // var msgType = scanner.next();
-                    // System.out.printf("%s: %s%n", entry.getKey(), msgType);
-                    // switch (msgType) {
-                    switch(scanner.next()) {
-                        case "TINYPROJ$MOVE":
-                            assert scanner.next().equals(entry.getKey());
-                            movePlayer(entry.getKey(), scanner.nextInt());
-                            break;
-                        case "TINYPROJ$SYNC_OK":
-                            synchronized (syncBarrier) {
-                                syncBarrier.notify();
-                            }
-                            break;
-                        case "TINYPROJ$HEARTBEAT_OK":
-                            heartbeatMap.put(entry.getKey(), true);
-                            break;
-                        default:
-                            assert false;
+
+                var channel = (SocketChannel) k.channel();
+                var buf = Transport.socketReceiveRaw(channel);
+                if (buf == null) {
+                    k.cancel();
+                    continue;  // heartbeat to cover failure
+                }
+                int msgType = buf.getInt(), msgLen = buf.getInt();
+                switch (msgType) {
+                    case Transport.InitBackupRequestMessage.TYPE: {
+                        var msg = (Transport.InitBackupRequestMessage) Transport.parse(buf);
+                        log.fine(msg.toString());
+                        assert backup == null;
+                        // should sync on appMutex?
+                        Transport.send(
+                            channel, Transport.InitBackupReplyMessage.TYPE,
+                            new Transport.InitBackupReplyMessage(app)
+                        );
+                        backup = channel;
+
+                        if (msg.viewId() > view.id()) {
+                            assert view.id() == 1;
+                            assert msg.viewId() == 2;
+                            tracker.query();
+                            return;
+                        }
+                        break;
                     }
+                    case Transport.HelloMessage.TYPE: {
+                        var msg = (Transport.HelloMessage) Transport.parse(buf);
+                        log.fine(msg.toString());
+                        if (!workerTable.containsKey(msg.name())) {
+                            workerTable.put(msg.name(), new WorkerThread(msg.name(), channel, this));
+                            workerTable.get(msg.name()).start();
+                        } else {
+                            workerTable.get(msg.name()).channel = channel;
+                        }
+                        break;
+                    }
+                    case Transport.SyncOkMessage.TYPE: {
+                        var msg = (Transport.SyncOkMessage) Transport.parse(buf);
+                        log.fine(msg.toString());
+                        assert inSync != null;
+                        assert !syncDone;
+                        syncDone = true;
+                        synchronized (syncBarrier) {
+                            syncBarrier.notify();
+                        }
+                        break;
+                    }
+                    case Transport.HeartbeatMessage.TYPE: {
+                        var msg = (Transport.HeartbeatMessage) Transport.parse(buf);
+                        // log.fine(msg.toString());
+                        heartbeatSet.add(msg.name());
+                        Transport.send(
+                            channel, Transport.HeartbeatOkMessage.TYPE,
+                            new Transport.HeartbeatOkMessage(view.id())
+                        );
+                        if (pendingSwitchBackup) {
+                            var nextBackup = msg.name();
+                            log.fine("pending end: next backup = " + nextBackup);
+                            tracker.playerFail(view.id(), view.backup(), nextBackup);
+                            return;
+                        }
+                        break;
+                    }
+                    default:
+                        throw new RuntimeException();
                 }
             }
+            serverSel.selectedKeys().clear();
         }
     }
 
-    private void kickPlayer(String player) throws Exception {
-        System.out.println("* Kick player " + player);
-        var writer = new StringWriter();
-        writer.write("TINYPROJ$PLAYER_FAIL\n");
-        writer.write(player + "\n");
-        var buf = writer.toString().getBytes();
-        tracker.send(new DatagramPacket(buf, buf.length));
+    private static class WorkerThread extends Thread {
+        private final String name;
+        private SocketChannel channel;
+        private final LinkedBlockingQueue<Integer> taskQueue;
+        private final Game game;
 
-        if (mode != null && mode.equals("PRIMARY")) {
-            connMap.remove(player);
-            if (player.equals(view.backup) && inSyncThread != null) {
-                inSyncThread.interrupt();
-                inSyncThread = null;
-            }
-
-            // TODO player thread
+        public WorkerThread(String name, SocketChannel channel, Game game) {
+            this.name = name;
+            this.channel = channel;
+            this.game = game;
+            taskQueue = new LinkedBlockingQueue<>();
         }
-    }
 
-    private void queryView() throws Exception {
-        var writer = new StringWriter();
-        writer.write("TINYPROJ$QUERY\n");
-        var buf = writer.toString().getBytes();
-        tracker.send(new DatagramPacket(buf, buf.length));
-    }
-
-    private void movePlayer(String name, int direction) throws Exception {
-        // should be inside startView, backup => primary
-        if (!threadMap.containsKey(name)) {
-            // assert direction == 0;
-            queueMap.put(name, new LinkedBlockingQueue<>());
-            threadMap.put(name, new PlayerThread(this, name));
-            threadMap.get(name).start();
-        }
-        queueMap.get(name).put(direction);
-    }
-
-    private void syncState() throws Exception {
-        if (view.backup == null || !connMap.containsKey(view.backup)) {
-            return;
-        }
-        var writer = new StringWriter();
-        writer.write("TINYPROJ$SYNC\n");
-        // TODO
-        connMap.get(view.backup).getOutputStream().write(writer.toString().getBytes());
-        synchronized (syncBarrier) {
-            syncBarrier.wait();
-        }
-    }
-
-    private void sendState(String name) throws Exception {
-        if (name.equals(this.name)) {
-            synchronized (moveBarrier) {
-                moveBarrier.notify();
-            }
-            return;
-        }
-        var writer = new StringWriter();
-        writer.write("TINYPROJ$STATE\n");
-        // TODO
-        if (connMap.containsKey(name)) {
+        private static final Logger log = Logger.getGlobal();
+        public void run() {
+            interrupted();
+            log.info("worker start: " + name);
             try {
-                connMap.get(name).getOutputStream().write(writer.toString().getBytes());
-            } catch (IOException e) {
-                //
-            } 
+                synchronized (game.appMutex) {
+                    if (!game.app.playerSet().contains(name)) {
+                        game.app.createPlayer(name);
+                        log.entering(Game.class.getName(), "syncApp", "name = " + name);
+                        game.syncApp();
+                    }
+                }
+                log.info("player ready: " + name);
+                while (true) {
+                    int direction;
+                    try {
+                        direction = taskQueue.take();
+                    } catch (InterruptedException e) {
+                        interrupted();
+                        break;
+                    }
+                    synchronized (game.appMutex) {
+                        // TODO app logic
+                        // TODO sync app with backup
+                    }
+                    // TODO reply client
+                    assert channel != null || game.name.equals(name);
+                }
+                synchronized (game.appMutex) {
+                    game.app.removePlayer(name);
+                    log.entering(Game.class.getName(), "syncApp", "removed name = " + name);
+                    game.syncApp();
+                }
+            } catch (Throwable e) {
+                log.throwing(WorkerThread.class.getName(), getName(), e);
+                System.exit(1);
+            }
         }
     }
 
+    private void syncApp() throws Exception {
+        if (backup == null) {
+            log.info("backup not present so skip sync");
+            return;
+        }
+        // assert sync-ed with appMutex, so no concurrent within this method
+        assert inSync == null;
+        assert syncDone;
+        syncDone = false;
+        log.entering(Game.class.getName(), "inSync", "thread = " + Thread.currentThread());
+        inSync = Thread.currentThread();
+        try {
+            synchronized (syncBarrier) {
+                Transport.send(
+                    backup, Transport.SyncMessage.TYPE,
+                    new Transport.SyncMessage(app)    
+                );
+                // TODO backup crash during this
+                log.entering("syncBarrier", "wait");
+                while (!syncDone) {
+                    syncBarrier.wait();
+                }
+                log.exiting("syncBarrier", "wait");
+            }            
+        } finally {
+            inSync = null;
+            log.exiting(Game.class.getName(), "inSync", "thread = " + Thread.currentThread());
+        }
+    }
+
+    boolean primaryHeartbeat, stopGuard = false;
     private void runClient() throws Exception {
-        var scanner = new Scanner(client.getInputStream());
-        while (true) {
-            String msgType;
+        primaryHeartbeat = true;
+        var master = Thread.currentThread();
+        assert !stopGuard;  // previous guard already exit
+        (new Thread(() -> {
             try {
-                msgType = scanner.next();
-            } catch (NoSuchElementException e) {
-                kickPlayer(view.primary);
-                uiThread.interrupt();
+                while (true) {
+                    Transport.send(
+                        client, Transport.HeartbeatMessage.TYPE,
+                        new Transport.HeartbeatMessage(name)
+                    );
+                    Thread.sleep(500);
+                    if (stopGuard) {
+                        stopGuard = false;
+                        return;
+                    }
+                    log.fine("check: primary hearbeat = " + primaryHeartbeat);
+                    if (!primaryHeartbeat) {
+                        if (view.backup().equals(name)) {
+                            log.info("primary fail but no idea on next backup so keep query");
+                            while (true) {
+                                Thread.sleep(50);
+                                log.info("query");
+                                tracker.query();
+                                if (tracker.receiveView().id() > this.view.id()) {
+                                    tracker.query();  // silly
+                                    break;
+                                }
+                            }
+                        } else {
+                            log.info("primary fail: next backup = " + name + " (aka self)");
+                            tracker.playerFail(view.id(), view.primary(), name);
+                        }
+                        master.interrupt();
+                        return;
+                    }
+                    primaryHeartbeat = false;
+                }
+            } catch (Throwable e) {
+                log.throwing(Game.class.getName(), "client guard", e);
+                System.exit(1);
+            }
+        })).start();
+        while (!master.interrupted()) {
+            ByteBuffer buf;
+            try {
+                buf = Transport.socketReceiveRaw(client);
+                if (buf == null) {
+                    // 1200ms (new client) waiting + 200ms reaction + 100ms redundant
+                    Thread.sleep(1500);
+                    throw new RuntimeException();  // unreachable
+                }
+            } catch (InterruptedException | ClosedByInterruptException e) {
+                client.close();
+                client = null;
+                master.interrupted();
                 return;
             }
+            int msgType = buf.getInt(), msgLen = buf.getInt();
             switch (msgType) {
-                case "TINYPROJ$STATE":
-                    synchronized (moveBarrier) {
-                        moveBarrier.notify();
+                case Transport.SyncMessage.TYPE: {
+                    var msg = (Transport.SyncMessage) Transport.parse(buf);
+                    assert view.backup().equals(name);
+                    assert app != null;
+                    app = msg.app();
+                    log.fine("sync done: player set = " + app.playerSet());
+                    Transport.send(
+                        client, Transport.SyncOkMessage.TYPE,
+                        new Transport.SyncOkMessage()
+                    );
+                    break;
+                }
+                case Transport.HeartbeatOkMessage.TYPE:
+                    var msg = (Transport.HeartbeatOkMessage) Transport.parse(buf);
+                    primaryHeartbeat = true;
+                    if (msg.viewId() > view.id()) {
+                        tracker.query();
+                        stopGuard = true;
+                        return;
                     }
                     break;
-                case "TINYPROJ$RESET":
-                    System.out.println("* Reset view");
-                    queryView();
-                    return;
-                case "TINYPROJ$SYNC": {
-                    assert mode.equals("BACKUP");
-                    // TODO
-                    var writer = new StringWriter();
-                    writer.write("TINYPROJ$SYNC_OK\n");
-                    client.getOutputStream().write(writer.toString().getBytes());
-                    break;
-                }
-                case "TINYPROJ$HEARTBEAT": {
-                    var writer = new StringWriter();
-                    writer.write("TINYPROJ$HEARTBEAT_OK\n");
-                    client.getOutputStream().write(writer.toString().getBytes());
-                    break;
-                }
                 default:
-                    assert false;       
+                    throw new RuntimeException();
             }
         }
     }
+}
 
-    private void moveThis(int direction) throws Exception {
-        if (mode.equals("PRIMARY")) {
-            movePlayer(name, direction);
-            synchronized (moveBarrier) {
-                moveBarrier.wait();
-            }
-            return;
-        }
-        var writer = new StringWriter();
-        writer.write("TINYPROJ$MOVE\n");
-        writer.write(name + "\n");
-        writer.write(direction + "\n");
-        client.getOutputStream().write(writer.toString().getBytes());
-        try {
-            synchronized (moveBarrier) {
-                moveBarrier.wait();
-            }
-        } catch (InterruptedException e) {
-            System.out.println("** Move interrupt");
-            var view = this.view;
-            while (this.view == view) {
-                Thread.sleep(100);
-            }
-            System.out.println("** Retry interrupted move");
-            moveThis(direction);
-        }
+class App implements Serializable {
+    private final HashMap<String, Boolean> playerTable;
+    public App() {
+        playerTable = new HashMap<>();
     }
 
-    private static class UIThread extends Thread {
-        private final Game game;
-        UIThread(Game game) {
-            this.game = game;
-        }
-
-        public void run() {
-            try {
-                while (game.view == null) {
-                    Thread.sleep(100);
-                }
-                System.out.println("** UI thread start");
-                game.moveThis(0);
-
-                var scanner = new Scanner(System.in);
-                while (true) {
-                    var direction = scanner.nextInt();
-                    game.moveThis(direction);
-                }
-            } catch (InterruptedException e) {
-                System.out.println("** Idle interrupt");
-                run();
-            } catch (Exception e) {
-                e.printStackTrace();
-                System.exit(1);
-            }
-        }
+    public Set<String> playerSet() {
+        return playerTable.keySet();
     }
 
-    private static class PlayerThread extends Thread {
-        private final Game game;
-        private String name;
-        PlayerThread(Game game, String name) {
-            this.game = game;
-            this.name = name;
-        }
+    public void createPlayer(String name) {
+        playerTable.put(name, true);  // TODO
+    }
 
-        public void run() {
-            try {
-                // TODO initialize player
-                while (true) {
-                    var direction = game.queueMap.get(name).take();
-                    synchronized (game.appMutex) {
-                        System.out.printf(
-                            "** Mutex move: player = %s, direction = %d%n", 
-                            name, direction
-                        );
-                        // TODO update
-
-                        assert game.inSyncThread == null;
-                        game.inSyncThread = Thread.currentThread();
-                        try {
-                            game.syncState();
-                        } catch (InterruptedException e) {
-                            System.out.println("** Give up interrupted sync");
-                        }
-                        game.inSyncThread = null;
-                    }
-                    game.sendState(name);
-                }
-            } catch (Exception e) {
-                e.printStackTrace();
-                System.exit(1);
-            }
-        }
+    public void removePlayer(String name) {
+        playerTable.remove(name);
     }
 }
