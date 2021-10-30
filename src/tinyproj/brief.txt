@@ -2,7 +2,7 @@ tinyproj
 
 A simple starting point of Random Collection of Rigid Things (RCRT) project. A distributed, primary-backup replicated system written in Java.
 
-Coded and tested with OpenJDK 17 @ Ubuntu 20.04.3:
+Coded and tested with OpenJDK 17 @ Ubuntu 20.04.3. Within `src/tinyproj`:
 $ javac StressTest.java
 $ ./run
 

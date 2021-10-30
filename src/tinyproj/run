@@ -3,10 +3,10 @@ set -e
 trap "jobs -p | xargs -r kill" EXIT
 
 if [ Tracker.class -ot Tracker.java ] || [ Transport.class -ot Tracker.java ]; then
-    javac Tracker.java
+    javac -sourcepath . Tracker.java
 fi
 if [ Game.class -ot Game.java ] || [ Transport.class -ot Game.java ] || [ Tracker.class -ot Game.java ]; then
-    javac Game.java
+    javac -sourcepath . Game.java
 fi
 
 java -ea Tracker 6789 15 10 &
