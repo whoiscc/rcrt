@@ -45,5 +45,9 @@ def init(db_path):
         'text': 'This is my first post.',
         'time': time.time(),
     }
+    meta[util.generate_id(meta)] = {
+        'type': 'link',
+        'url': 'https://github.com/sgdxbc/',
+    }
     with open(db_path / 'meta.json', 'w') as meta_file:
         json.dump(meta, meta_file)
