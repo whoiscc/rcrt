@@ -1,5 +1,6 @@
 import string
 import random
+import time
 
 
 def generate_id(meta):
@@ -10,3 +11,7 @@ def generate_id(meta):
         ))
         if identifier not in meta:
             return identifier
+
+
+def past_day(day_count):
+    return time.time() - day_count * 86400
