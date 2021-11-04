@@ -29,9 +29,21 @@ def serve(db_path):
     def db_content(path):
         return flask.send_from_directory(app.config['DB_PATH'], path)
 
-    @app.route(SUBPATH + '/edit/<entry_id>')
-    def edit_entry(entry_id=None):
-        raise NotImplementedError
+    @app.route(SUBPATH + '/edit/<path>', methods=['POST'])
+    def edit_entry(path=None):
+        if path == 'meta':
+            update = flask.request.get_json()
+            with open(db_path / 'meta.json') as meta_file:
+                meta = json.load(meta_file)
+            for identifier in update:
+                assert identifier in meta
+                meta[identifier] = update[identifier]
+            with open(db_path / 'meta.json', 'w') as meta_file:
+                json.dump(meta, meta_file)
+        else:
+            with open(db_path / path, 'wb') as entry_file:
+                entry_file.write(flask.request.get_data())
+        return 'Ok'
 
     app.run(port=1102, debug=True)
     print()
@@ -57,17 +69,10 @@ def init(db_path):
         'time': util.past_day(2),
         'series': 'Series of Test Things',
     }
-    image_id = util.generate_id(meta)
-    meta[image_id] = {
-        'type': 'image',
-        'ext': 'jpeg',
-    }
     with open(db_path / 'meta.json', 'w') as meta_file:
         json.dump(meta, meta_file)
     with open(db_path / f'{article_id}.txt', 'w') as article_file:
         article_file.write(
             f'This is a test article, written by [me]#{link_id}.\n\n'
             f'This is the second paragraph. This is a [link]#{article_id} to this article self.\n\n'
-            f'[This is Miss Diana.]#{image_id}\n\n'
         )
-    # write image

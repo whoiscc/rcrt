@@ -4,17 +4,27 @@ function startApp() {
     console.log('app mode: ' + window.rcrtMode);
     window.addEventListener('load', startAppCallback);
     window.addEventListener('hashchange', startAppCallback);
+    window.addEventListener('keydown', (event) => {
+        if (event.key === 'Shift') {
+            shiftDown = true;
+        }
+    });
+    window.addEventListener('keyup', (event) => {
+        if (event.key === 'Shift') {
+            shiftDown = false;
+        }
+    });
 }
 
 function startAppCallback() {
     const path = (new URL(window.location.href)).hash;
     fetch('db/meta.json').then(resp => resp.json()).then(meta => {
-        const page = 
-            path === "" ? 
-                createFrontPage(meta) : 
-            path.startsWith('#_hidden/') ?
-                createHiddenPage(meta, path.slice(9)) :
-                createPage(meta, path.slice(1));
+        const page =
+            path === "" ?
+                createFrontPage(meta) :
+                path.startsWith('#_hidden/') ?
+                    createHiddenPage(meta, path.slice(9)) :
+                    createPage(meta, path.slice(1));
         document.body.innerHTML = '';
         document.body.appendChild(page);
         document.title = 'Rigid Timeline';  // TODO
@@ -26,6 +36,25 @@ function startAppCallback() {
 
 const FONT_SANS = 'Noto Sans CJK SC';
 const FONT_MONO = 'Noto Sans Mono';
+
+let shiftDown = false;
+function addEdit(node, entering, exiting) {
+    if (window.rcrtMode !== 'editable') {
+        return;
+    }
+    node.addEventListener('click', function startEdit(event) {
+        if (!shiftDown) {
+            return;
+        }
+        event.preventDefault();
+        node.removeEventListener('click', startEdit);
+        entering();
+        node.addEventListener('blur', () => {
+            exiting();
+            node.addEventListener('click', startEdit);
+        }, { once: true });
+    });
+}
 
 function addPageStyle(node) {
     node.style.display = 'block';
@@ -81,7 +110,7 @@ function addLogoNode(node) {
 
 function getTimeString(time) {
     return (new Date(time * 1000)).toLocaleString('zh', {
-        hour12: false, dateStyle: 'long',  timeStyle: 'short',
+        hour12: false, dateStyle: 'long', timeStyle: 'short',
     });
 }
 
@@ -149,8 +178,27 @@ function createArticlePage(meta, identifier) {
     addPageStyle(node);
     addLogoNode(node);
     const title = document.createElement('h1');
-    title.innerText = meta[identifier].title;
     addTitleStyle(title);
+    addEdit(title, () => {
+        title.setAttribute('contenteditable', 'true');
+        title.focus();
+    }, () => {
+        title.removeAttribute('contenteditable');
+        meta[identifier].title = title.innerText;
+        fetch('edit/meta', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                [identifier]: meta[identifier]
+            }),
+        }).then(() => {
+            console.log('TODO clear updating status');
+        });
+        console.log('TODO set updating status');
+    });
+    title.innerText = meta[identifier].title;
     node.appendChild(title);
     if (meta[identifier].series !== "") {
         const series = document.createElement('p');
