@@ -7,6 +7,7 @@ import manager.util as util
 
 SUBPATH = '/rcrt'
 HTML_STUB = (
+    '<link rel="shortcut icon" type="image/png" href="app/favicon.png"/>'
     '<script src = "app/core.js"></script>'
     '<script>window.rcrtMode = "{mode}"; startApp();</script>'
 )

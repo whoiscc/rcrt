@@ -65,6 +65,17 @@ function addLinkStyle(node) {
     node.style.color = 'black';
 }
 
+function addLogoNode(node) {
+    const logo = new Image(256, 256);
+    logo.src = 'app/logo.png';
+    logo.style.display = 'block';
+    logo.style.margin = '0 auto';
+    const logoA = document.createElement('a');
+    logoA.appendChild(logo);
+    logoA.href = '#';
+    node.appendChild(logoA);
+}
+
 function getTimeString(time) {
     return (new Date(time * 1000)).toLocaleString('zh', {
         hour12: false, dateStyle: 'long',  timeStyle: 'short',
@@ -132,6 +143,7 @@ function createPostPage(meta, identifier) {
 function createArticlePage(meta, identifier) {
     const node = document.createElement('div');
     addPageStyle(node);
+    addLogoNode(node);
     const title = document.createElement('h1');
     title.innerText = meta[identifier].title;
     addTitleStyle(title);
