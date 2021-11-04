@@ -18,6 +18,9 @@ function startAppCallback() {
         document.body.innerHTML = '';
         document.body.appendChild(page);
         document.title = 'Rigid Timeline';  // TODO
+        if (path !== "") {
+            document.title += ' (WIP)';
+        }
     });
 }
 
@@ -129,6 +132,7 @@ function createLinkPage(meta, identifier) {
 function createPostPage(meta, identifier) {
     const node = document.createElement('div');
     addPageStyle(node);
+    addLogoNode(node);
     const time = document.createElement('p');
     addTimeStyle(time);
     time.innerText = getTimeString(meta[identifier].time);
